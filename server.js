@@ -175,9 +175,19 @@ app.post('/transcribe', async (req, res) => {
   } catch (error) {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.error(`[ERROR] After ${elapsed}s:`, error.message);
+    // Extract detailed error info
+    let detail = error.message;
+    if (error.response) {
+      // Axios error with response
+      detail = `HTTP ${error.response.status} from ${error.config?.url?.split('?')[0] || 'unknown'}: ${JSON.stringify(error.response.data).slice(0, 500)}`;
+    } else if (error.errors) {
+      // Google API error
+      detail = `Google API: ${JSON.stringify(error.errors).slice(0, 500)}`;
+    }
+    console.error(`[ERROR DETAIL]`, detail);
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: detail,
     });
   }
 });
