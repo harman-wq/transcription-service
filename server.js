@@ -1,8 +1,11 @@
 const express = require('express');
 const { google } = require('googleapis');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const FormData = require('form-data');
 const axios = require('axios');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
@@ -15,7 +18,7 @@ const auth = new google.auth.GoogleAuth({
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'transcription-service' });
+  res.json({ status: 'ok', service: 'transcription-service', version: 2 });
 });
 
 // Main transcription endpoint
@@ -28,10 +31,12 @@ app.post('/transcribe', async (req, res) => {
 
   console.log(`[START] Transcribing file: ${drive_file_id}`);
   const startTime = Date.now();
+  const tmpFile = path.join(os.tmpdir(), `audio_${Date.now()}.mp3`);
 
   try {
-    // 1. Get file metadata first
-    const driveClient = google.drive({ version: 'v3', auth: await auth.getClient() });
+    // 1. Get file metadata
+    const client = await auth.getClient();
+    const driveClient = google.drive({ version: 'v3', auth: client });
     const meta = await driveClient.files.get({
       fileId: drive_file_id,
       fields: 'name,size,mimeType',
@@ -40,102 +45,86 @@ app.post('/transcribe', async (req, res) => {
     const fileSizeMB = (parseInt(meta.data.size || '0') / (1024 * 1024)).toFixed(1);
     console.log(`[META] ${fileName} (${fileSizeMB} MB, ${meta.data.mimeType})`);
 
-    // 2. Stream download from Google Drive
-    console.log('[DOWNLOAD] Starting stream from Google Drive...');
-    const downloadResponse = await driveClient.files.get(
-      { fileId: drive_file_id, alt: 'media' },
-      { responseType: 'stream' }
-    );
+    // 2. Get a fresh access token for ffmpeg to use directly
+    const tokenResponse = await client.getAccessToken();
+    const accessToken = tokenResponse.token;
+    console.log('[AUTH] Got access token for ffmpeg');
 
-    // 3. Pipe through ffmpeg to extract audio
-    // Output: 16kHz mono MP3 at 64kbps (a 5-min video → ~2.4 MB audio)
-    console.log('[FFMPEG] Extracting audio...');
+    // 3. Let ffmpeg download and extract audio directly
+    // This way Node.js NEVER buffers the huge video file in memory.
+    // ffmpeg handles the HTTP download + audio extraction in native code.
+    const driveUrl = `https://www.googleapis.com/drive/v3/files/${drive_file_id}?alt=media`;
+
+    console.log('[FFMPEG] Starting direct download + audio extraction...');
     const ffmpeg = spawn('ffmpeg', [
-      '-i', 'pipe:0',     // read video from stdin
-      '-vn',               // no video
-      '-ac', '1',          // mono
-      '-ar', '16000',      // 16kHz sample rate (optimal for Whisper)
-      '-b:a', '64k',       // 64kbps bitrate
-      '-f', 'mp3',         // MP3 format
-      'pipe:1',            // output to stdout
+      '-headers', `Authorization: Bearer ${accessToken}\r\n`,
+      '-i', driveUrl,
+      '-vn',
+      '-ac', '1',
+      '-ar', '16000',
+      '-b:a', '64k',
+      '-f', 'mp3',
+      tmpFile,
     ]);
 
-    // Pipe Drive stream → ffmpeg stdin
-    downloadResponse.data.pipe(ffmpeg.stdin);
-
-    // Handle download stream errors
-    downloadResponse.data.on('error', (err) => {
-      console.error('[DOWNLOAD ERROR]', err.message);
-      ffmpeg.stdin.destroy();
-    });
-
-    // Collect ffmpeg audio output
-    const audioChunks = [];
-    ffmpeg.stdout.on('data', (chunk) => audioChunks.push(chunk));
-
-    // Track ffmpeg progress via stderr
+    // Track progress
     let lastLog = Date.now();
+    let stderrData = '';
     ffmpeg.stderr.on('data', (data) => {
+      stderrData += data.toString();
       const now = Date.now();
-      if (now - lastLog > 10000) {
-        // Log every 10 seconds
-        const line = data.toString().trim().split('\n').pop();
-        console.log(`[FFMPEG] ${line.slice(-120)}`);
+      if (now - lastLog > 15000) {
+        const lines = stderrData.trim().split('\n');
+        const lastLine = lines[lines.length - 1];
+        console.log(`[FFMPEG] ${lastLine.slice(-150)}`);
         lastLog = now;
       }
     });
 
     // Wait for ffmpeg to finish
-    await new Promise((resolve, reject) => {
-      ffmpeg.on('close', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`ffmpeg exited with code ${code}`));
-      });
-      ffmpeg.on('error', reject);
-      ffmpeg.stdin.on('error', () => {
-        // Ignore EPIPE - happens when ffmpeg closes before download finishes
+    const ffmpegCode = await new Promise((resolve) => {
+      ffmpeg.on('close', resolve);
+      ffmpeg.on('error', (err) => {
+        console.error('[FFMPEG SPAWN ERROR]', err.message);
+        resolve(1);
       });
     });
 
-    const audioBuffer = Buffer.concat(audioChunks);
+    if (ffmpegCode !== 0) {
+      const lastLines = stderrData.trim().split('\n').slice(-5).join('\n');
+      throw new Error(`ffmpeg exited with code ${ffmpegCode}. Last output: ${lastLines.slice(-300)}`);
+    }
+
+    // 4. Read the audio file
+    if (!fs.existsSync(tmpFile)) {
+      throw new Error('ffmpeg did not produce output file');
+    }
+
+    const audioBuffer = fs.readFileSync(tmpFile);
     const audioSizeMB = (audioBuffer.length / (1024 * 1024)).toFixed(2);
     console.log(`[FFMPEG DONE] Audio extracted: ${audioSizeMB} MB`);
 
+    fs.unlinkSync(tmpFile);
+
     if (audioBuffer.length === 0) {
-      throw new Error('ffmpeg produced no audio output - file may not contain an audio track');
+      throw new Error('ffmpeg produced empty audio - file may not contain an audio track');
     }
 
-    // 4. Check if audio is under Whisper's 25MB limit
+    // 5. If audio > 25MB, re-encode at lower bitrate
+    let finalAudio = audioBuffer;
     if (audioBuffer.length > 25 * 1024 * 1024) {
-      // Very long video - audio too large even compressed. Re-encode at lower bitrate.
       console.log('[WARNING] Audio > 25MB, re-encoding at 32kbps...');
-      const reEncode = spawn('ffmpeg', [
-        '-i', 'pipe:0', '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k', '-f', 'mp3', 'pipe:1',
-      ]);
-
-      const reChunks = [];
-      reEncode.stdout.on('data', (c) => reChunks.push(c));
-
-      const audioStream = require('stream');
-      const readable = new audioStream.Readable();
-      readable.push(audioBuffer);
-      readable.push(null);
-      readable.pipe(reEncode.stdin);
-
-      await new Promise((resolve, reject) => {
-        reEncode.on('close', (code) => (code === 0 ? resolve() : reject(new Error('re-encode failed'))));
-        reEncode.on('error', reject);
-      });
-
-      const reBuffer = Buffer.concat(reChunks);
-      console.log(`[RE-ENCODE] New size: ${(reBuffer.length / (1024 * 1024)).toFixed(2)} MB`);
-      audioChunks.length = 0;
-      audioChunks.push(reBuffer);
+      const tmpInput = path.join(os.tmpdir(), `audio_in_${Date.now()}.mp3`);
+      const tmpOutput = path.join(os.tmpdir(), `audio_re_${Date.now()}.mp3`);
+      fs.writeFileSync(tmpInput, audioBuffer);
+      execFileSync('ffmpeg', ['-i', tmpInput, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '32k', '-f', 'mp3', tmpOutput]);
+      finalAudio = fs.readFileSync(tmpOutput);
+      fs.unlinkSync(tmpOutput);
+      fs.unlinkSync(tmpInput);
+      console.log(`[RE-ENCODE] New size: ${(finalAudio.length / (1024 * 1024)).toFixed(2)} MB`);
     }
 
-    const finalAudio = audioChunks.length === 1 ? audioChunks[0] : Buffer.concat(audioChunks);
-
-    // 5. Send to OpenAI Whisper API
+    // 6. Send to OpenAI Whisper API
     console.log('[WHISPER] Sending to OpenAI Whisper API...');
     const formData = new FormData();
     formData.append('file', finalAudio, {
@@ -155,7 +144,7 @@ app.post('/transcribe', async (req, res) => {
         },
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
-        timeout: 300000, // 5 min timeout for Whisper
+        timeout: 300000,
       }
     );
 
@@ -173,15 +162,14 @@ app.post('/transcribe', async (req, res) => {
       processing_time_seconds: parseFloat(elapsed),
     });
   } catch (error) {
+    try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (e) {}
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.error(`[ERROR] After ${elapsed}s:`, error.message);
-    // Extract detailed error info
     let detail = error.message;
     if (error.response) {
-      // Axios error with response
       detail = `HTTP ${error.response.status} from ${error.config?.url?.split('?')[0] || 'unknown'}: ${JSON.stringify(error.response.data).slice(0, 500)}`;
     } else if (error.errors) {
-      // Google API error
       detail = `Google API: ${JSON.stringify(error.errors).slice(0, 500)}`;
     }
     console.error(`[ERROR DETAIL]`, detail);
@@ -192,11 +180,10 @@ app.post('/transcribe', async (req, res) => {
   }
 });
 
-// Set server timeout to 15 minutes (large files take time to stream)
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
-  console.log(`Transcription service running on port ${PORT}`);
+  console.log(`Transcription service v2 running on port ${PORT}`);
   console.log('Endpoints: GET /health, POST /transcribe');
 });
-server.timeout = 900000; // 15 minutes
+server.timeout = 900000;
 server.keepAliveTimeout = 900000;
