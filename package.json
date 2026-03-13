@@ -1,0 +1,15 @@
+{
+  "name": "transcription-service",
+  "version": "1.0.0",
+  "description": "FFmpeg audio extraction + Whisper transcription for large video files",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "googleapis": "^144.0.0",
+    "axios": "^1.7.0",
+    "form-data": "^4.0.1"
+  }
+}
